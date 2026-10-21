@@ -76,6 +76,14 @@ NSString *YTEncodeParameter(NSString *value);
 
 @property (nonatomic, readonly) BOOL isSuccessful;
 
+/**
+ * Что успел разобрать получатель потокового чтения; у обычных запросов nil.
+ *
+ * Подача SABR разбирает ответ по ходу приёма и целиком его не держит
+ * (см. YTUmpCollector): разобранное едет к разбору вместе с ответом.
+ */
+@property (nonatomic, strong) id streamed;
+
 /** Тело строкой в UTF-8. */
 @property (nonatomic, readonly) NSString *text;
 
@@ -156,6 +164,21 @@ NSString *YTEncodeParameter(NSString *value);
  * потока, не с главного.
  */
 + (YTHttpResponse *)stream:(NSURLRequest *)request
+                 onHeaders:(void (^)(YTHttpResponse *head))onHeaders
+                   onChunk:(BOOL (^)(NSData *chunk))onChunk;
+
+/**
+ * То же, но с пределом тишины: если за `idleLimit` секунд не пришло
+ * ни байта, запрос обрывается с ошибкой тайм-аута.
+ *
+ * Своего срока у соединения тридцать секунд, и для подачи это слишком
+ * долго. Через VPN запрос к googlevideo.com однажды не получил даже
+ * заголовков: полминуты ожидания, запас в четырнадцать секунд кончился
+ * на середине, и ролик стоял ещё шестнадцать, хотя повтор приходил
+ * за секунду. Ноль — без предела, как у обычного вызова.
+ */
++ (YTHttpResponse *)stream:(NSURLRequest *)request
+                 idleLimit:(NSTimeInterval)idleLimit
                  onHeaders:(void (^)(YTHttpResponse *head))onHeaders
                    onChunk:(BOOL (^)(NSData *chunk))onChunk;
 

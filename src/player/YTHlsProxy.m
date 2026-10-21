@@ -2559,6 +2559,30 @@
  * хотя бы частью. Ровно так же поступает и обычный путь, только там
  * границы берутся из карты `sidx`.
  */
+/**
+ * Подачу записи сменили, а сборка куска для неё ещё идёт.
+ *
+ * Смена качества открывает новую подачу, но поток, который собирал кусок
+ * для прежнего плеера, об этом не знает. В журнале с iPad 4 он висел
+ * в запросе, дождался тайм-аута, счёл подачу мёртвой, сходил в `/player`,
+ * обновил её и ещё полминуты качал 1080p рядом с новой 720p: два потока
+ * мегабайт на одной связи, прыжки «набранное сброшено» по чужому времени
+ * и в конце — снятие приложения. Плеера у такой сборки нет, отдавать
+ * некому, и ей лучше уйти сразу.
+ *
+ * У эфира подача подменяется на ходу при том же показе, и кусок ему
+ * отдать надо — его не трогаем.
+ */
+- (BOOL)sabrAbandoned:(YTSabr *)sabr {
+    if (sabr == nil || [sabr liveMode]) {
+        return NO;
+    }
+
+    @synchronized (_lock) {
+        return sabr != _sabr;
+    }
+}
+
 - (NSData *)buildSabrSegment:(NSInteger)index {
     YTSabr *sabr = nil;
     YTTrackInit *videoInit = nil;
@@ -2772,7 +2796,7 @@
     }
 
     for (NSInteger attempt = 0; attempt < 4; attempt++) {
-        if ([self audioCoverIn:sabr from:from] >= to - 0.05) {
+        if ([self audioCoverIn:sabr from:from] >= to - 0.05 || [self sabrAbandoned:sabr]) {
             return;
         }
 
@@ -2856,6 +2880,13 @@
     NSInteger found = 0;
 
     for (NSInteger attempt = 0; attempt < 6; attempt++) {
+        if ([self sabrAbandoned:sabr]) {
+            NSLog(@"[YouTube/Прокси] Подача сменилась — кусок %ld для прежней "
+                  @"не собираем", (long)index);
+
+            return nil;
+        }
+
         if (mapped || [sabr liveMode]) {
             found = ([sabr videoSegment:sequence] != nil) ? sequence : 0;
         } else {
@@ -2987,7 +3018,8 @@
          * сразу и без паузы: удалось — следующий круг спросит уже по
          * свежему адресу.
          */
-        if ([sabr needsReload] && [YTStreams renewSabr:sabr]) {
+        // Подачу, которую уже сменили, не обновляем: /player ей ни к чему.
+        if ([sabr needsReload] && ![self sabrAbandoned:sabr] && [YTStreams renewSabr:sabr]) {
             continue;
         }
 

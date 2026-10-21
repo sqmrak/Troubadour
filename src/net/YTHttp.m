@@ -129,9 +129,16 @@ static NSString *const YTServerTrustMethod = @"NSURLAuthenticationMethodServerTr
     NSUInteger _limit;
     dispatch_semaphore_t _done;
     NSURLConnection *_connection;
+
+    /** Сторож тишины и когда в последний раз что-то пришло; оба — на сетевом потоке. */
+    NSTimer *_watchdog;
+    CFAbsoluteTime _lastActivity;
 }
 
 @property (nonatomic, strong) YTHttpResponse *result;
+
+/** Предел тишины в секундах; 0 — без него. */
+@property (nonatomic, assign) NSTimeInterval idleLimit;
 
 /** Класть ли ответ в дисковый кеш. */
 @property (nonatomic, assign) BOOL caching;
@@ -193,13 +200,60 @@ static NSString *const YTServerTrustMethod = @"NSURLAuthenticationMethodServerTr
     [_connection scheduleInRunLoop:[NSRunLoop currentRunLoop]
                            forMode:NSDefaultRunLoopMode];
     [_connection start];
+
+    /**
+     * Сторож тишины живёт на том же потоке, что и соединение.
+     *
+     * Тогда обрыв по тишине и обычные вызовы соединения идут по очереди
+     * и друг другу не мешают: после `cancel` соединение больше ничего
+     * не присылает, и ответ, который получит вызывающий, никто
+     * не поправит у него за спиной.
+     */
+    if (self.idleLimit > 0) {
+        _lastActivity = CFAbsoluteTimeGetCurrent();
+
+        _watchdog = [NSTimer timerWithTimeInterval:1.0
+                                            target:self
+                                          selector:@selector(checkIdle:)
+                                          userInfo:nil
+                                           repeats:YES];
+
+        [[NSRunLoop currentRunLoop] addTimer:_watchdog forMode:NSDefaultRunLoopMode];
+    }
+}
+
+- (void)checkIdle:(NSTimer *)timer {
+    if (CFAbsoluteTimeGetCurrent() - _lastActivity < self.idleLimit) {
+        return;
+    }
+
+    [_connection cancel];
+
+    if (self.result.error == nil) {
+        self.result.error = [NSError errorWithDomain:YTHttpErrorDomain
+                                                code:NSURLErrorTimedOut
+                                            userInfo:[NSDictionary dictionaryWithObject:YTLoc(@"Сервер не ответил")
+                                                                                 forKey:NSLocalizedDescriptionKey]];
+    }
+
+    NSLog(@"[YouTube/HTTP] Сервер молчит %.0f с — обрываем: %@",
+          self.idleLimit, [[[_connection originalRequest] URL] host]);
+
+    [self finish];
 }
 
 - (void)cancelOnThread {
+    [_watchdog invalidate];
+    _watchdog = nil;
+
     [_connection cancel];
 }
 
 - (void)finish {
+    // Сторож снимается здесь же: таймер держит вызов, пока его не снимут.
+    [_watchdog invalidate];
+    _watchdog = nil;
+
     dispatch_semaphore_signal(_done);
 }
 
@@ -207,6 +261,8 @@ static NSString *const YTServerTrustMethod = @"NSURLAuthenticationMethodServerTr
 
 - (void)connection:(NSURLConnection *)connection didReceiveResponse:(NSURLResponse *)response {
     [_buffer setLength:0];
+
+    _lastActivity = CFAbsoluteTimeGetCurrent();
 
     self.result.headersAt = CFAbsoluteTimeGetCurrent();
     self.result.expectedLength = [response expectedContentLength];
@@ -235,6 +291,8 @@ static NSString *const YTServerTrustMethod = @"NSURLAuthenticationMethodServerTr
 }
 
 - (void)connection:(NSURLConnection *)connection didReceiveData:(NSData *)data {
+    _lastActivity = CFAbsoluteTimeGetCurrent();
+
     // Потоковый режим: отдаём кусок сразу и ничего не накапливаем.
     if (self.onChunk != nil) {
         if (!self.onChunk(data)) {
@@ -745,9 +803,17 @@ static BOOL YTTrustIsValid(SecTrustRef trust, NSString *host) {
 + (YTHttpResponse *)stream:(NSURLRequest *)request
                  onHeaders:(void (^)(YTHttpResponse *head))onHeaders
                    onChunk:(BOOL (^)(NSData *chunk))onChunk {
+    return [self stream:request idleLimit:0 onHeaders:onHeaders onChunk:onChunk];
+}
+
++ (YTHttpResponse *)stream:(NSURLRequest *)request
+                 idleLimit:(NSTimeInterval)idleLimit
+                 onHeaders:(void (^)(YTHttpResponse *head))onHeaders
+                   onChunk:(BOOL (^)(NSData *chunk))onChunk {
     YTHttpCall *call = [[YTHttpCall alloc] init];
 
     [call setCaching:NO];
+    [call setIdleLimit:idleLimit];
     [call setOnHeaders:onHeaders];
     [call setOnChunk:onChunk];
 

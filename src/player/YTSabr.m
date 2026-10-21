@@ -40,6 +40,9 @@
 @property (nonatomic, assign) int64_t startMs;
 @property (nonatomic, assign) int64_t durationMs;
 
+/** Длина фрагмента в байтах (поле 14); 0 — сервер не сказал. */
+@property (nonatomic, assign) uint64_t contentLength;
+
 @end
 
 @implementation YTSabrHeader
@@ -51,6 +54,7 @@
 @synthesize sequence = _sequence;
 @synthesize startMs = _startMs;
 @synthesize durationMs = _durationMs;
+@synthesize contentLength = _contentLength;
 
 @end
 
@@ -67,6 +71,14 @@
 
     /** Когда последний раз пришёл кусок — любой, хоть повтор. */
     NSTimeInterval _lastMediaAt;
+
+    /**
+     * Когда пришёл последний байт любого ответа, в целых секундах.
+     *
+     * Пишет сетевой поток, читает главный; целое в 32 бита читается
+     * и пишется за раз, замок не нужен.
+     */
+    volatile int32_t _lastByteSecond;
 
     /**
      * Получили часть №69 — в следующем запросе обязано уйти поле 24.
@@ -533,6 +545,24 @@ enum { YTLiveCushion = 120 };
 
 - (BOOL)stepDownVideo {
     if (_hardPin) {
+        return NO;
+    }
+
+    /**
+     * Сеть молчит совсем — качество ни при чём.
+     *
+     * Спуск помогает, когда байты идут, но не поспевают. Когда же
+     * запрос висит без единого байта, ниже дорожка ничего не ускорит:
+     * в журнале с iPad 4 за одну такую тишину ролик съехал с 1080p
+     * до 360p тремя ступенями, пока один запрос ждал своего тайм-аута.
+     */
+    int32_t lastByte = _lastByteSecond;
+    int32_t second = (int32_t)[NSDate timeIntervalSinceReferenceDate];
+
+    if (lastByte > 0 && second - lastByte >= 8) {
+        NSLog(@"[YouTube/Подача] Не спускаемся: сеть молчит %ld с — дело не в качестве",
+              (long)(second - lastByte));
+
         return NO;
     }
 
@@ -1889,6 +1919,7 @@ enum { YTLiveCushion = 120 };
             case 9: header.sequence = (NSInteger)[reader takeVarint]; break;
             case 11: header.startMs = (int64_t)[reader takeVarint]; break;
             case 12: header.durationMs = (int64_t)[reader takeVarint]; break;
+            case 14: header.contentLength = [reader takeVarint]; break;
             case 15: range = [reader takeData]; break;
             default: break;
         }
@@ -2108,6 +2139,85 @@ enum { YTLiveCushion = 120 };
     return names;
 }
 
+/**
+ * Цел ли фрагмент: боксы mp4 идут встык и кончаются ровно с телом.
+ *
+ * Такой проверки не было, и в плеер уходило всё, что пришло. В журнале
+ * с iPad 4 звук приходил по 29 КБ вместо 157 — без начала, первым
+ * «боксом» стоял мусор, — а видео с `mdat`, объявленным на 4,2 МБ,
+ * весило 3,8. Склейка честно собирала из этого кусок: десять секунд
+ * без звука, обрыв картинки на середине.
+ *
+ * Длину из заголовка (поле 14) берём вторым доводом: если боксы
+ * не сошлись, но длина совпала, значит фрагмент пришёл, как послан.
+ * WebM по боксам не проверить — там только длина.
+ */
+- (BOOL)fragmentIsWhole:(NSData *)body expected:(uint64_t)expected {
+    const uint8_t *bytes = (const uint8_t *)[body bytes];
+    NSUInteger length = [body length];
+
+    BOOL webm = (length >= 4 && bytes[0] == 0x1A && bytes[1] == 0x45 &&
+                 bytes[2] == 0xDF && bytes[3] == 0xA3);
+
+    if (webm) {
+        return expected == 0 || (uint64_t)length == expected;
+    }
+
+    {
+        NSUInteger at = 0;
+        BOOL broken = NO;
+
+        while (at < length) {
+            if (at + 8 > length) {
+                broken = YES;
+                break;
+            }
+
+            uint64_t size = ((uint64_t)bytes[at] << 24) | ((uint64_t)bytes[at + 1] << 16) |
+                            ((uint64_t)bytes[at + 2] << 8) | (uint64_t)bytes[at + 3];
+
+            // Имя бокса — четыре печатных знака; мусор вместо начала виден сразу.
+            for (NSUInteger i = 4; i < 8; i++) {
+                if (bytes[at + i] < 0x20 || bytes[at + i] > 0x7E) {
+                    broken = YES;
+                }
+            }
+
+            if (broken) {
+                break;
+            }
+
+            if (size == 1) {
+                if (at + 16 > length) {
+                    broken = YES;
+                    break;
+                }
+
+                size = 0;
+
+                for (NSUInteger i = 8; i < 16; i++) {
+                    size = (size << 8) | bytes[at + i];
+                }
+            } else if (size == 0) {
+                size = length - at;
+            }
+
+            if (size < 8 || (uint64_t)at + size > (uint64_t)length) {
+                broken = YES;
+                break;
+            }
+
+            at += (NSUInteger)size;
+        }
+
+        if (!broken) {
+            return YES;
+        }
+    }
+
+    return expected > 0 && (uint64_t)length == expected;
+}
+
 /** Человеческое имя части — чтобы перечень читался. */
 - (NSString *)nameOfPart:(NSUInteger)type {
     switch (type) {
@@ -2132,10 +2242,11 @@ enum { YTLiveCushion = 120 };
 - (void)handlePart:(YTUmpPart *)part {
     NSString *name = [self nameOfPart:part.type];
 
+    // Длина — объявленная потоком: у кусков от собирателя тела при себе нет.
     [_seen appendFormat:@"%@%@:%lu",
         [_seen length] > 0 ? @" " : @"",
         name ?: [NSString stringWithFormat:@"#%lu", (unsigned long)part.type],
-        (unsigned long)[part.body length]];
+        (unsigned long)part.size];
 
     switch (part.type) {
         case YTUmpMediaHeader: {
@@ -2150,6 +2261,7 @@ enum { YTLiveCushion = 120 };
         }
 
         case YTUmpMedia: {
+            // От собирателя кусок уже лежит в своём фрагменте — тела нет.
             if ([part.body length] < 1) {
                 break;
             }
@@ -2164,8 +2276,9 @@ enum { YTLiveCushion = 120 };
             NSMutableData *body = [_openBodies objectForKey:
                 [NSNumber numberWithUnsignedInteger:headerId]];
 
-            [body appendData:[part.body subdataWithRange:
-                NSMakeRange(1, [part.body length] - 1)]];
+            // Без промежуточной копии: на ответе 1080p их набирались мегабайты.
+            [body appendBytes:(const uint8_t *)[part.body bytes] + 1
+                       length:[part.body length] - 1];
 
             break;
         }
@@ -2179,16 +2292,41 @@ enum { YTLiveCushion = 120 };
                 ((const uint8_t *)[part.body bytes])[0]];
 
             YTSabrHeader *header = [_openHeaders objectForKey:key];
-            NSData *body = [_openBodies objectForKey:key];
+
+            // От собирателя фрагмент приходит готовым, прочитанное целиком — по кускам.
+            NSData *body = (part.media != nil) ? part.media : [_openBodies objectForKey:key];
 
             [_openHeaders removeObjectForKey:key];
             [_openBodies removeObjectForKey:key];
 
             if (header == nil || [body length] == 0) {
+                if (header != nil && !header.isInit) {
+                    NSLog(@"[YouTube/Подача] Фрагмент №%ld (itag %ld) не собрался — "
+                          @"выброшен, сервер пришлёт его снова",
+                          (long)header.sequence, (long)header.itag);
+                }
+
                 break;
             }
 
             BOOL isVideo = [self isVideoItag:header.itag];
+
+            /**
+             * Неполный фрагмент не берём вовсе.
+             *
+             * Взятый, он ложится в перечень набранного, и сервер его
+             * больше не шлёт: дыра остаётся навсегда. Выброшенный — не
+             * в перечне, и следующий же ответ приносит его целым.
+             */
+            if (![self fragmentIsWhole:body expected:header.contentLength]) {
+                NSLog(@"[YouTube/Подача] Фрагмент %@ №%ld пришёл неполным: "
+                      @"%lu из %llu байт, боксы: %@ — выброшен, сервер пришлёт снова",
+                      isVideo ? @"видео" : @"звука", (long)header.sequence,
+                      (unsigned long)[body length], header.contentLength,
+                      [self boxesIn:body]);
+
+                break;
+            }
 
             /**
              * У эфира заголовок дорожки лежит **внутри каждого куска**.
@@ -2699,6 +2837,15 @@ enum { YTLiveCushion = 120 };
                          */
                         _url = [moved copy];
                         _redirected = YES;
+
+                        /**
+                         * Новому узлу перечень дорожек называем заново.
+                         *
+                         * Он знает о нас только то, что придёт в запросе.
+                         * На Android запрос после переезда ушёл без перечня,
+                         * и эфир отвечал пустотой, пока перечень не вернули.
+                         */
+                        _toldFormats = NO;
 
                         NSLog(@"[YouTube/Подача] Переезд на другой узел");
                     }
@@ -3735,33 +3882,64 @@ static const NSUInteger YTSabrMeasureBytes = 128 * 1024;
     NSTimeInterval startedAt = [NSDate timeIntervalSinceReferenceDate];
 
     /**
-     * Тело читаем потоком и собираем сами — ради отметки времени
-     * посреди тела (см. YTSabrWarmBytes). Ответ от этого не меняется.
+     * Тело читаем потоком и разбираем по ходу (см. YTUmpCollector).
+     *
+     * Целиком копится только ответ с отказом — его тело нужно журналу.
+     * Удачный ответ сразу режется на части, и от него в памяти остаются
+     * лишь фрагменты: на 1080p60 это девять мегабайт вместо тридцати.
      */
     NSMutableData *body = [NSMutableData data];
+    YTUmpCollector *collector = [[YTUmpCollector alloc] init];
 
+    __block BOOL parsing = NO;
+    __block unsigned long long received = 0;
     __block NSTimeInterval warmAt = 0;
-    __block NSUInteger warmBytes = 0;
+    __block unsigned long long warmBytes = 0;
+
+    /**
+     * Предел тишины: двенадцать секунд у записи, двадцать у эфира.
+     *
+     * У эфира сервер вправе придержать ответ, пока кусок не снят (поле 29),
+     * у записи ему ждать нечего — ответ начинается за доли секунды.
+     */
+    NSTimeInterval idle = _liveMode ? 20.0 : 12.0;
 
     YTHttpResponse *response = [YTHttp stream:request
+                                    idleLimit:idle
                                     onHeaders:^(YTHttpResponse *head) {
-        // Новый ответ — тело с нуля, как делает и обычное чтение.
+        // Новый ответ — всё с нуля, как делает и обычное чтение.
         [body setLength:0];
+        [collector reset];
+
+        parsing = [head isSuccessful];
+        received = 0;
         warmAt = 0;
         warmBytes = 0;
+
+        self->_lastByteSecond = (int32_t)[NSDate timeIntervalSinceReferenceDate];
     }
                                       onChunk:^BOOL(NSData *chunk) {
-        [body appendData:chunk];
+        received += [chunk length];
 
-        if (warmAt == 0 && [body length] >= YTSabrWarmBytes) {
+        if (parsing) {
+            [collector feed:chunk];
+        } else {
+            [body appendData:chunk];
+        }
+
+        // Связь жива: по этой отметке судят, стоит ли спускать качество.
+        self->_lastByteSecond = (int32_t)[NSDate timeIntervalSinceReferenceDate];
+
+        if (warmAt == 0 && received >= YTSabrWarmBytes) {
             warmAt = [NSDate timeIntervalSinceReferenceDate];
-            warmBytes = [body length];
+            warmBytes = received;
         }
 
         return YES;
     }];
 
     response.body = body;
+    response.streamed = parsing ? collector : nil;
 
     /**
      * Скорость — по установившейся части тела.
@@ -3779,51 +3957,82 @@ static const NSUInteger YTSabrMeasureBytes = 128 * 1024;
      */
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
 
-    NSUInteger measured = [body length];
+    unsigned long long measured = received;
     NSTimeInterval from = (response.headersAt > startedAt && response.headersAt < now)
         ? response.headersAt : startedAt;
 
-    if (warmAt > 0 && [body length] >= warmBytes + YTSabrMeasureBytes) {
-        measured = [body length] - warmBytes;
+    if (warmAt > 0 && received >= warmBytes + YTSabrMeasureBytes) {
+        measured = received - warmBytes;
         from = warmAt;
     }
 
-    [YTPlaybackStats noteTransfer:measured
+    [YTPlaybackStats noteTransfer:(NSUInteger)measured
                           elapsed:now - from
                             paced:_liveMode];
 
     return response;
 }
 
+/** Отказ запроса: два подряд — подача мертва. */
+- (void)noteFailure:(YTHttpResponse *)response {
+    _failures++;
+
+    NSLog(@"[YouTube/Подача] Запрос %ld не удался: код %ld, отказ подряд %ld",
+          (long)_requestNumber - 1, (long)response.statusCode, (long)_failures);
+
+    /**
+     * Отказ два раза подряд — сессия подачи кончилась: адрес мёртв,
+     * нового он не даст. Лечится тем же, чем и просьба сервера:
+     * сходить в `/player` заново.
+     */
+    if (_failures >= 2 && !_needsReload) {
+        _needsReload = YES;
+        _reloadToken = nil;
+
+        NSLog(@"[YouTube/Подача] Подача мертва — просим свежий ответ /player");
+    }
+}
+
 - (BOOL)absorb:(YTHttpResponse *)response {
-    if (![response isSuccessful] || [response.body length] == 0) {
-        _failures++;
+    YTUmpCollector *collector = [response.streamed isKindOfClass:[YTUmpCollector class]]
+        ? (YTUmpCollector *)response.streamed : nil;
 
-        NSLog(@"[YouTube/Подача] Запрос %ld не удался: код %ld, отказ подряд %ld",
-              (long)_requestNumber - 1, (long)response.statusCode, (long)_failures);
+    unsigned long long size = (collector != nil) ? [collector bytes] : [response.body length];
 
-        /**
-         * Отказ два раза подряд — сессия подачи кончилась: адрес мёртв,
-         * нового он не даст. Лечится тем же, чем и просьба сервера:
-         * сходить в `/player` заново.
-         */
-        if (_failures >= 2 && !_needsReload) {
-            _needsReload = YES;
-            _reloadToken = nil;
+    /**
+     * Оборванный ответ — не пустой ответ.
+     *
+     * Сеть могла замолчать на середине, когда несколько фрагментов уже
+     * пришли целиком. Прежде выбрасывалось всё, и те же мегабайты
+     * качались заново; теперь целые берём, а недособранный хвост
+     * пропадает сам — его нет в перечне, и сервер пришлёт его снова.
+     */
+    BOOL cut = (response.error != nil && collector != nil && size > 0);
 
-            NSLog(@"[YouTube/Подача] Подача мертва — просим свежий ответ /player");
-        }
+    if (!cut && (![response isSuccessful] || size == 0)) {
+        [self noteFailure:response];
 
         return NO;
     }
 
-    _failures = 0;
-
+    NSUInteger deliveredBefore = _delivered;
     NSUInteger tail = 0;
 
-    [YTUmp read:response.body remainder:&tail handler:^(YTUmpPart *part) {
-        [self handlePart:part];
-    }];
+    if (collector != nil) {
+        NSArray *parts = [collector finish];
+
+        tail = [collector tail];
+
+        for (YTUmpPart *part in parts) {
+            @autoreleasepool {
+                [self handlePart:part];
+            }
+        }
+    } else {
+        [YTUmp read:response.body remainder:&tail handler:^(YTUmpPart *part) {
+            [self handlePart:part];
+        }];
+    }
 
     NSLog(@"[YouTube/Подача] Части ответа: %@",
           [_seen length] > 0 ? _seen : @"пусто");
@@ -3831,13 +4040,25 @@ static const NSUInteger YTSabrMeasureBytes = 128 * 1024;
     [_seen setString:@""];
 
     NSLog(@"[YouTube/Подача] Ответ %lu КБ: видео %lu фрагментов, звук %lu, "
-          @"заголовки %@/%@%@",
-          (unsigned long)([response.body length] / 1024),
+          @"заголовки %@/%@%@%@",
+          (unsigned long)(size / 1024),
           (unsigned long)[_videoSegments count],
           (unsigned long)[_audioSegments count],
           _videoInit != nil ? @"есть" : @"нет",
           _audioInit != nil ? @"есть" : @"нет",
-          tail > 0 ? @", хвост не разобран" : @"");
+          tail > 0 ? @", хвост не разобран" : @"",
+          cut ? @", оборван — взяты целые фрагменты" : @"");
+
+    if (cut) {
+        // Ни одного целого фрагмента — такой обрыв ничем не лучше отказа.
+        if (_delivered == deliveredBefore) {
+            [self noteFailure:response];
+        } else {
+            _failures = 0;
+        }
+    } else {
+        _failures = 0;
+    }
 
     return ([_videoSegments count] > 0 || _videoInit != nil);
 }
