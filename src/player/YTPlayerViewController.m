@@ -5942,6 +5942,41 @@ static NSMutableArray *YTJamItems = nil;
     }
 }
 
+/**
+ * Подробности отказа плеера — то, чего не видно в «Не удалось выполнить
+ * операцию».
+ *
+ * На iPad 1 плеер трижды отказывал через две секунды после старта —
+ * и с подачей, и с готовыми адресами, — а прокси не получил от него
+ * ни одного запроса. По одной фразе не отличить «не достучался до
+ * 127.0.0.1» от «достучался и не понял ответа». Код ошибки, вложенная
+ * ошибка и собственный журнал плеера (какой адрес он просил и что ему
+ * ответили) отличают.
+ */
+- (void)logPlayerFailure:(AVPlayerItem *)item {
+    NSError *error = [item error];
+    NSError *inner = [[error userInfo] objectForKey:NSUnderlyingErrorKey];
+
+    NSLog(@"[YouTube/Плеер] Отказ: %@ %ld%@; запросов до прокси дошло %lu",
+          [error domain], (long)[error code],
+          inner != nil ? [NSString stringWithFormat:@", внутри %@ %ld",
+                             [inner domain], (long)[inner code]] : @"",
+          (unsigned long)[[YTHlsProxy shared] playerRequests]);
+
+    NSArray *events = [[item errorLog] events];
+    NSUInteger from = [events count] > 4 ? [events count] - 4 : 0;
+
+    for (NSUInteger i = from; i < [events count]; i++) {
+        AVPlayerItemErrorLogEvent *event = [events objectAtIndex:i];
+
+        NSLog(@"[YouTube/Плеер] Журнал плеера: %@ — %@ %ld, %@",
+              [event URI], [event errorDomain], (long)[event errorStatusCode],
+              [event errorComment] ?: @"без пояснений");
+    }
+
+    NSLog(@"[YouTube/Плеер] Прокси системы: %@", [[YTHlsProxy shared] systemProxyNote]);
+}
+
 - (void)observeValueForKeyPath:(NSString *)path
                       ofObject:(id)object
                         change:(NSDictionary *)change
@@ -5963,6 +5998,8 @@ static NSMutableArray *YTJamItems = nil;
         if (status == AVPlayerItemStatusFailed) {
             NSLog(@"[YouTube/Плеер] Поток не открылся: %@",
                   [[_observedItem error] localizedDescription]);
+
+            [self logPlayerFailure:_observedItem];
 
             /**
              * Один повтор, если раздача отказала из-за сменившегося

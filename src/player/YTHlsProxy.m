@@ -7,6 +7,7 @@
 #import <unistd.h>
 #import <errno.h>
 #import <string.h>
+#import <dlfcn.h>
 
 #import "YTHttp.h"
 #import "YTMp4.h"
@@ -92,6 +93,9 @@
 
     /** Отказ случился из-за сменившегося выхода в сеть. */
     BOOL _refusedByAddress;
+
+    /** Сколько запросов плеера дошло до нас за этот поток. */
+    NSUInteger _playerRequests;
 
     /** Подача, если играем через неё. */
     YTSabr *_sabr;
@@ -324,7 +328,22 @@
     uint16_t previous = 0;
 
     if (_socket >= 0) {
-        NSLog(@"[YouTube/Прокси] Порт %u больше не слушает — поднимаем заново", _port);
+        /**
+         * Почему не слушает — тоже в журнал.
+         *
+         * Закрытый описатель отвечает ошибкой, а занятый чужим сокетом
+         * отвечает, что он не слушающий. Второе значит, что наш описатель
+         * кто-то закрыл по ошибке и номер ушёл другому.
+         */
+        int listening = 0;
+        socklen_t size = sizeof(listening);
+
+        NSString *why = (getsockopt(_socket, SOL_SOCKET, SO_ACCEPTCONN, &listening, &size) != 0)
+            ? [NSString stringWithFormat:@"описатель %d: %s", _socket, strerror(errno)]
+            : [NSString stringWithFormat:@"описатель %d занят не слушающим сокетом", _socket];
+
+        NSLog(@"[YouTube/Прокси] Порт %u больше не слушает (%@) — поднимаем заново",
+              _port, why);
 
         previous = _port;
 
@@ -391,6 +410,15 @@
     }
 
     NSLog(@"[YouTube/Прокси] Слушаем 127.0.0.1:%u", _port);
+
+    // Прокси системы — один раз за запуск: от него зависит, дойдёт ли до нас плеер.
+    static BOOL proxyNoted = NO;
+
+    if (!proxyNoted) {
+        proxyNoted = YES;
+
+        NSLog(@"[YouTube/Прокси] Прокси системы: %@", [self systemProxyNote]);
+    }
 
     /**
      * Приёмный круг получает свой описатель значением, а не через
@@ -713,6 +741,8 @@
 
     // Ожидаем «/<сессия>/p.m3u8» либо «/<сессия>/s/<номер>.ts».
     if ([parts count] < 3) {
+        NSLog(@"[YouTube/Прокси] Непонятный путь: %@ — 404", path);
+
         [self send:client status:@"404 Not Found" type:@"text/plain" body:nil];
         return;
     }
@@ -737,9 +767,14 @@
         if (session != _session) {
             // Просит прежний плеер — отвечаем отказом, но не ошибкой:
             // он всё равно вот-вот будет отпущен.
+            NSLog(@"[YouTube/Прокси] Запрос прежнего потока %lu (нынешний %lu): %@ — 410",
+                  (unsigned long)session, (unsigned long)_session, path);
+
             [self send:client status:@"410 Gone" type:@"text/plain" body:nil];
             return;
         }
+
+        _playerRequests++;
 
         playlist = _playlist;
         segments = _segments;
@@ -4063,6 +4098,94 @@
     }
 }
 
+- (NSUInteger)playerRequests {
+    @synchronized (_lock) {
+        return _playerRequests;
+    }
+}
+
+/**
+ * Что говорит система о прокси.
+ *
+ * Сами мы прокси не ставим нигде. А в журнале с iPad 1 запросы
+ * к youtube.com и к sponsor.ajay.app падали с системным «Проблема связи
+ * с надёжным прокси-сервером (HTTPS)», и плеер трижды не дошёл до нашего
+ * 127.0.0.1 — ни одного запроса плейлиста. Прокси из настроек Wi-Fi
+ * первый подозреваемый, и по журналу его должно быть видно сразу.
+ *
+ * Функции берутся через dlsym: прямых ссылок на CFNetwork в бинарнике
+ * нет, и появляться им незачем.
+ */
+- (NSString *)systemProxyNote {
+    typedef CFDictionaryRef (*YTProxySettingsFunc)(void);
+    typedef CFArrayRef (*YTProxiesForURLFunc)(CFURLRef url, CFDictionaryRef settings);
+
+    YTProxySettingsFunc copySettings =
+        (YTProxySettingsFunc)dlsym(RTLD_DEFAULT, "CFNetworkCopySystemProxySettings");
+    YTProxiesForURLFunc copyProxies =
+        (YTProxiesForURLFunc)dlsym(RTLD_DEFAULT, "CFNetworkCopyProxiesForURL");
+
+    if (copySettings == NULL) {
+        return @"узнать не у кого";
+    }
+
+    NSDictionary *settings = (__bridge_transfer NSDictionary *)copySettings();
+
+    NSMutableArray *said = [NSMutableArray array];
+
+    if ([[settings objectForKey:@"HTTPEnable"] boolValue]) {
+        [said addObject:[NSString stringWithFormat:@"HTTP %@:%@",
+            [settings objectForKey:@"HTTPProxy"], [settings objectForKey:@"HTTPPort"]]];
+    }
+
+    if ([[settings objectForKey:@"HTTPSEnable"] boolValue]) {
+        [said addObject:[NSString stringWithFormat:@"HTTPS %@:%@",
+            [settings objectForKey:@"HTTPSProxy"], [settings objectForKey:@"HTTPSPort"]]];
+    }
+
+    if ([[settings objectForKey:@"ProxyAutoConfigEnable"] boolValue]) {
+        [said addObject:[NSString stringWithFormat:@"PAC %@",
+            [settings objectForKey:@"ProxyAutoConfigURLString"]]];
+    }
+
+    if ([[settings objectForKey:@"ProxyAutoDiscoveryEnable"] boolValue]) {
+        [said addObject:@"поиск WPAD"];
+    }
+
+    NSString *set = [said count] > 0 ? [said componentsJoinedByString:@", "] : @"нет";
+
+    if (copyProxies == NULL || settings == nil) {
+        return set;
+    }
+
+    // Как пойдёт запрос плеера к нам.
+    NSURL *loopback = [NSURL URLWithString:
+        [NSString stringWithFormat:@"http://127.0.0.1:%u/", _port]];
+
+    NSArray *proxies = (__bridge_transfer NSArray *)
+        copyProxies((__bridge CFURLRef)loopback, (__bridge CFDictionaryRef)settings);
+
+    NSMutableArray *route = [NSMutableArray array];
+
+    for (NSDictionary *proxy in proxies) {
+        NSString *type = [proxy objectForKey:@"kCFProxyTypeKey"];
+
+        if ([type isEqualToString:@"kCFProxyTypeNone"]) {
+            [route addObject:@"напрямую"];
+        } else if ([type isEqualToString:@"kCFProxyTypeAutoConfigurationURL"]) {
+            [route addObject:@"как решит PAC"];
+        } else {
+            [route addObject:[NSString stringWithFormat:@"через %@:%@ (%@)",
+                [proxy objectForKey:@"kCFProxyHostNameKey"],
+                [proxy objectForKey:@"kCFProxyPortNumberKey"],
+                type]];
+        }
+    }
+
+    return [NSString stringWithFormat:@"%@; к 127.0.0.1 — %@", set,
+        [route count] > 0 ? [route componentsJoinedByString:@", затем "] : @"не сказано"];
+}
+
 - (NSTimeInterval)duration {
     return _duration;
 }
@@ -4135,6 +4258,7 @@
         _relayTotal = 0;
         _explained = NO;
         _refusedByAddress = NO;
+        _playerRequests = 0;
     }
 }
 
